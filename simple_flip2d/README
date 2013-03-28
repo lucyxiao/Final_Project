@@ -1,0 +1,11 @@
+Code is generally uncommented: do not ask me for more details if you cannot
+work it out by yourself. A better documented version with more features will
+come down the road.
+
+To compile the simulation:
+1) edit Makefile.defs for your architecture
+2) "make depend"
+3) either "make" or "make release" (optimized version)
+
+Do the same thing for the code in the subdirectory "viewflip2d",
+which is a simple 2D viewer for the simulation output.

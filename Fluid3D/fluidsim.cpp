@@ -295,7 +295,7 @@ void FluidSim::project(float dt) {
    
 }
 
-void FluidSim::set_boundary(float (*phi)(const Vec3f&)) {
+void FluidSim::set_liquid_boundary(float (*phi)(const Vec3f&)) {
    for(int k = 0; k < nk+1; ++k)
 		for(int j = 0; j < nj+1; ++j)
 			for(int i = 0; i < ni+1; ++i) {
@@ -308,9 +308,9 @@ void FluidSim::initialize_mparticles(float (*phi)(const Vec3f&)) {
 	int seed = 0;
 	int seedi = 0; // for determining whether the particle is inside
 
-   for(int k = 0; k < nk+1; ++k)
-		for(int j = 0; j < nj+1; ++j)
-			for(int i = 0; i < ni+1; ++i) {
+   for(int k = 0; k < nk; ++k)
+		for(int j = 0; j < nj; ++j)
+			for(int i = 0; i < ni; ++i) {
 				float corner[8];
 				corner[0] = interpolate_value(Vec3f(i*dx,j*dx,k*dx), levelset_phi);
 				corner[1] = interpolate_value(Vec3f(i*dx,j*dx,(k+1)*dx), levelset_phi);
@@ -369,7 +369,7 @@ void FluidSim::initialize_mparticles(float (*phi)(const Vec3f&)) {
 					else
 						mp->r = mp->s * phi_curr;
 
-					//TODO: check if the particle is inside solid boundary
+					//TODO: check if the particle is inside solid boundary?
 				}
 			}
 }
@@ -379,6 +379,11 @@ void FluidSim::advect_mparticles(float dt) {
 		mparticles[p]->pos = trace_rk2(mparticles[p]->pos, dt);
 	}
 }
+
+#define FOR_EACH_NEIGHBOR \
+	for (int i1=max(0,i-1); i1<=min(i+1,ni-1); i1+=2) \
+		for (int j1=max(0,j-1); j1<=min(j+1,nj-1); j1+=2) \
+			for (int k1=max(0,k-1); k1<=min(k+1,nk-1); k1+=2)
 
 void FluidSim::advect_levelset(float dt) { 
    for(int k = 0; k < nk+1; ++k)
@@ -391,7 +396,204 @@ void FluidSim::advect_levelset(float dt) {
 				levelset_phi(i, j, k) -= dt * dot(v, grad);
 			}
 
-	// recompute signed distance
+	// reconditioning
+	Array3f px, py, pz; // the coordinates of the closest surface point to each cell
+	Array3us known; // keeps track of which cells are known, 1 for known, 0 for unknown
+	Array3us inside; // whether a cell is inside, 0 for inside, 1 for outside, 2 for the boundary
+	Array3us hasDist; // whether a cell has got distance from a previous sweep
+
+	px.resize(ni, nj, nk);
+	py.resize(ni, nj, nk);
+	pz.resize(ni, nj, nk);
+	known.resize(ni, nj, nk);
+	known.assign(0);
+	inside.resize(ni, nj, nk);
+	hasDist.resize(ni, nj, nk);
+	hasDist.assign(0);
+
+	for(int k = 0; k < nk; ++k)
+		for(int j = 0; j < nj; ++j)
+			for(int i = 0; i < ni; ++i) {
+				Vec3f pos((i+0.5)*dx,(j+0.5)*dx,(k+0.5)*dx);
+				
+				if (levelset_phi(i, j, k) == 0) {
+					px(i, j, k) = pos[0];
+					py(i, j, k) = pos[1];
+					pz(i, j, k) = pos[2];
+					known(i, j, k) = 1;
+					inside(i, j, k) = 2;
+				}
+				else if (levelset_phi(i, j, k) < 0)
+					inside(i, j, k) = 0;
+				else
+					inside(i, j, k) = 1;
+
+				// compute closest surface points for boundary cells
+				bool boundary = false;
+				Vec3f sp; // surface point
+				float dist; // distance to surface point
+				float phi1 = levelset_phi(i, j, k);
+				FOR_EACH_NEIGHBOR {
+					if (inside(i1, j1, k1) != 2 && inside(i1, j1, k1) != inside(i, j, k)) {
+						if (!boundary) {
+							boundary = true;
+							Vec3f npos((i1+0.5)*dx, (j1+0.5)*dx, (k1+0.5)*dx);
+							float phi2 = levelset_phi(i1, j1, k1);
+							sp = abs(phi2) / abs(phi1-phi2) * pos + abs(phi1) / abs(phi1-phi2) * npos;
+							dist = mag(pos - sp); // magnitude of the vector
+						}
+						else {
+							Vec3f npos((i1+0.5)*dx, (j1+0.5)*dx, (k1+0.5)*dx);
+							float phi2 = levelset_phi(i1, j1, k1);
+							Vec3f sp1 = abs(phi2) / abs(phi1-phi2) * pos + abs(phi1) / abs(phi1-phi2) * npos;
+							float dist1 = mag(pos - sp1);
+							if (dist1 < dist) {
+								dist = dist1;
+								sp = sp1;
+							}
+						}
+					}
+				}
+				
+				if (boundary) {
+					px(i, j, k) = sp[0];
+					py(i, j, k) = sp[1];
+					pz(i, j, k) = sp[2];
+					known(i, j, k) = 1;
+					hasDist(i, j, k) = 1;
+					if (inside(i, j, k) == 0)
+						levelset_phi(i, j, k) = -dist;
+					else
+						levelset_phi(i, j, k) = dist;
+				}
+			}
+
+	// loop over all the other cells 
+	for(int k = 0; k < nk; ++k)
+		for(int j = 0; j < nj; ++j)
+			for(int i = 0; i < ni; ++i)  {
+				if (known(i, j, k) == 0) {
+					Vec3f pos((i+0.5)*dx,(j+0.5)*dx,(k+0.5)*dx);
+					bool updated = false;
+					Vec3f sp; // surface point
+					float dist; // distance to surface point
+					
+					if (hasDist(i, j, k)) {
+						sp = Vec3f(px(i, j, k), py(i, j, k), pz(i, j, k));
+						dist = abs(levelset_phi(i, j, k));
+					}
+
+					FOR_EACH_NEIGHBOR {
+						if (known(i1, j1, k1) == 1) {
+							if (hasDist(i, j, k)) {
+								Vec3f sp1 = Vec3f(px(i1, j1, k1), py(i1, j1, k1), pz(i1, j1, k1));
+								float dist1 = mag(pos - sp);
+								if (dist1 < dist) {
+									dist = dist1;
+									sp = sp1;
+									updated = true;
+								}
+							}
+							else {
+								if (!updated) {
+									updated = true;
+									sp = Vec3f(px(i1, j1, k1), py(i1, j1, k1), pz(i1, j1, k1));
+									dist = mag(pos - sp);
+								}
+								else {
+									Vec3f sp1 = Vec3f(px(i1, j1, k1), py(i1, j1, k1), pz(i1, j1, k1));
+									float dist1 = mag(pos - sp);
+									if (dist1 < dist) {
+										dist = dist1;
+										sp = sp1;
+									}
+								}
+							}
+						}
+					}
+
+					if (updated) {
+						px(i, j, k) = sp[0];
+						py(i, j, k) = sp[1];
+						pz(i, j, k) = sp[2];
+						known(i, j, k) = 1;
+						hasDist(i, j, k) = 1;
+						if (inside(i, j, k) == 0)
+							levelset_phi(i, j, k) = -dist;
+						else
+							levelset_phi(i, j, k) = dist;
+
+						FOR_EACH_NEIGHBOR {
+							if (dist < abs(levelset_phi(i1, j1, k1)))
+								known(i1, j1, k1) = 0;
+						}
+					}
+				}
+			}
+
+	// loop again in reversed order
+	// TODO: clean up the code
+	for(int k = nk-1; k >= 0; --k)
+		for(int j = nj-1; j >= 0; --j)
+			for(int i = ni-1; i >= 0; --i)  {
+				if (known(i, j, k) == 0) {
+					Vec3f pos((i+0.5)*dx,(j+0.5)*dx,(k+0.5)*dx);
+					bool updated = false;
+					Vec3f sp; // surface point
+					float dist; // distance to surface point
+					
+					if (hasDist(i, j, k)) {
+						sp = Vec3f(px(i, j, k), py(i, j, k), pz(i, j, k));
+						dist = abs(levelset_phi(i, j, k));
+					}
+
+					FOR_EACH_NEIGHBOR {
+						if (known(i1, j1, k1) == 1) {
+							if (hasDist(i, j, k)) {
+								Vec3f sp1 = Vec3f(px(i1, j1, k1), py(i1, j1, k1), pz(i1, j1, k1));
+								float dist1 = mag(pos - sp);
+								if (dist1 < dist) {
+									dist = dist1;
+									sp = sp1;
+									updated = true;
+								}
+							}
+							else {
+								if (!updated) {
+									updated = true;
+									sp = Vec3f(px(i1, j1, k1), py(i1, j1, k1), pz(i1, j1, k1));
+									dist = mag(pos - sp);
+								}
+								else {
+									Vec3f sp1 = Vec3f(px(i1, j1, k1), py(i1, j1, k1), pz(i1, j1, k1));
+									float dist1 = mag(pos - sp);
+									if (dist1 < dist) {
+										dist = dist1;
+										sp = sp1;
+									}
+								}
+							}
+						}
+					}
+
+					if (updated) {
+						px(i, j, k) = sp[0];
+						py(i, j, k) = sp[1];
+						pz(i, j, k) = sp[2];
+						known(i, j, k) = 1;
+						hasDist(i, j, k) = 1;
+						if (inside(i, j, k) == 0)
+							levelset_phi(i, j, k) = -dist;
+						else
+							levelset_phi(i, j, k) = dist;
+
+						FOR_EACH_NEIGHBOR {
+							if (dist < abs(levelset_phi(i1, j1, k1)))
+								known(i1, j1, k1) = 0;
+						}
+					}
+				}
+			}
 }
 
 //Apply RK2 to advect a point in the domain.
